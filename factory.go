@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"go.etcd.io/etcd/client/v3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // BackendType 后端类型枚举
@@ -108,7 +108,7 @@ func NewRedisDistributedLock(config *RedisConfig) (DistributedLock, error) {
 		return nil, fmt.Errorf("redis ping failed: %w", err)
 	}
 
-	return NewRedisLock(client, config.Prefix), nil
+	return NewRedisCombinedLock(client, config.Prefix), nil
 }
 
 // NewEtcdDistributedLock 创建Etcd分布式锁
@@ -147,7 +147,7 @@ func NewEtcdDistributedLock(config *EtcdConfig) (DistributedLock, error) {
 		}
 	}
 
-	return NewEtcdLock(client, config.Prefix), nil
+	return NewEtcdCombinedLock(client, config.Prefix), nil
 }
 
 // NewEtcdMutexDistributedLock 创建基于Mutex的Etcd分布式锁
@@ -156,10 +156,15 @@ func NewEtcdMutexDistributedLock(config *EtcdConfig) (DistributedLock, error) {
 		return nil, fmt.Errorf("etcd config cannot be nil")
 	}
 
-	client, err := clientv3.New(clientv3.Config{
-		Endpoints:   config.Endpoints,
-		DialTimeout: 5 * time.Second,
-	})
+	// 设置默认值
+	if config.Config == nil {
+		config.Config = &clientv3.Config{}
+	}
+	if config.Config.DialTimeout == 0 {
+		config.Config.DialTimeout = 5 * time.Second
+	}
+
+	client, err := clientv3.New(*config.Config)
 	if err != nil {
 		return nil, fmt.Errorf("create etcd client failed: %w", err)
 	}
@@ -168,9 +173,11 @@ func NewEtcdMutexDistributedLock(config *EtcdConfig) (DistributedLock, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if _, err := client.Status(ctx, config.Endpoints[0]); err != nil {
-		client.Close()
-		return nil, fmt.Errorf("etcd status check failed: %w", err)
+	if len(config.Config.Endpoints) > 0 {
+		if _, err := client.Status(ctx, config.Config.Endpoints[0]); err != nil {
+			client.Close()
+			return nil, fmt.Errorf("etcd status check failed: %w", err)
+		}
 	}
 
 	return NewEtcdMutexLock(client, config.Prefix), nil

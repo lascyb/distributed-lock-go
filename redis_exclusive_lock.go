@@ -11,39 +11,39 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// RedisLock Redis分布式锁实现
-type RedisLock struct {
+// RedisExclusiveLock Redis排他锁实现
+type RedisExclusiveLock struct {
 	client *redis.Client
 	prefix string
 	// 存储锁值的映射，用于线程安全的锁值管理
 	lockValues sync.Map
 }
 
-// NewRedisLock 创建Redis分布式锁实例
-func NewRedisLock(client *redis.Client, prefix string) *RedisLock {
+// NewRedisExclusiveLock 创建Redis排他锁实例
+func NewRedisExclusiveLock(client *redis.Client, prefix string) *RedisExclusiveLock {
 	if prefix == "" {
-		prefix = "lock:"
+		prefix = "exclusive:"
 	}
-	return &RedisLock{
+	return &RedisExclusiveLock{
 		client: client,
 		prefix: prefix,
 	}
 }
 
 // generateLockValue 生成锁值（用于标识锁的持有者）
-func (r *RedisLock) generateLockValue() string {
+func (r *RedisExclusiveLock) generateLockValue() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
 // getLockKey 获取完整的锁键名
-func (r *RedisLock) getLockKey(key string) string {
+func (r *RedisExclusiveLock) getLockKey(key string) string {
 	return r.prefix + key
 }
 
 // getLockValue 获取锁值，如果不存在则生成新的
-func (r *RedisLock) getLockValue(key string) string {
+func (r *RedisExclusiveLock) getLockValue(key string) string {
 	lockKey := r.getLockKey(key)
 
 	// 尝试从映射中获取锁值
@@ -57,8 +57,8 @@ func (r *RedisLock) getLockValue(key string) string {
 	return lockValue
 }
 
-// TryLock 尝试获取锁
-func (r *RedisLock) TryLock(ctx context.Context, key string, opts *LockOptions) (bool, error) {
+// TryLock 尝试获取排他锁
+func (r *RedisExclusiveLock) TryLock(ctx context.Context, key string, opts *LockOptions) (bool, error) {
 	if opts == nil {
 		opts = DefaultLockOptions()
 	}
@@ -66,17 +66,36 @@ func (r *RedisLock) TryLock(ctx context.Context, key string, opts *LockOptions) 
 	lockKey := r.getLockKey(key)
 	lockValue := r.getLockValue(key)
 
-	// 使用SET命令的NX和EX选项实现原子性加锁
-	result, err := r.client.SetNX(ctx, lockKey, lockValue, opts.TTL).Result()
+	// 使用Lua脚本检查共享锁并原子性地获取排他锁
+	script := `
+		-- 检查是否存在共享锁
+		local shared_counter = "shared_lock:" .. KEYS[1] .. ":counter"
+		if redis.call("exists", shared_counter) == 1 then
+			local count = redis.call("get", shared_counter)
+			if tonumber(count) > 0 then
+				return 0  -- 共享锁存在，无法获取排他锁
+			end
+		end
+		
+		-- 尝试获取排他锁
+		if redis.call("setnx", KEYS[2], ARGV[1]) == 1 then
+			redis.call("expire", KEYS[2], ARGV[2])
+			return 1  -- 成功获取排他锁
+		else
+			return 0  -- 排他锁已被其他客户端持有
+		end
+	`
+
+	result, err := r.client.Eval(ctx, script, []string{key, lockKey}, lockValue, int(opts.TTL.Seconds())).Result()
 	if err != nil {
-		return false, fmt.Errorf("redis setnx failed: %w", err)
+		return false, fmt.Errorf("redis eval failed: %w", err)
 	}
 
-	return result, nil
+	return result.(int64) == 1, nil
 }
 
-// Lock 获取锁（阻塞）
-func (r *RedisLock) Lock(ctx context.Context, key string, opts *LockOptions) error {
+// Lock 获取排他锁（阻塞）
+func (r *RedisExclusiveLock) Lock(ctx context.Context, key string, opts *LockOptions) error {
 	if opts == nil {
 		opts = DefaultLockOptions()
 	}
@@ -102,11 +121,11 @@ func (r *RedisLock) Lock(ctx context.Context, key string, opts *LockOptions) err
 		}
 	}
 
-	return fmt.Errorf("failed to acquire lock after %d retries", opts.RetryCount)
+	return fmt.Errorf("failed to acquire exclusive lock after %d retries", opts.RetryCount)
 }
 
-// Unlock 释放锁
-func (r *RedisLock) Unlock(ctx context.Context, key string) error {
+// Unlock 释放排他锁
+func (r *RedisExclusiveLock) Unlock(ctx context.Context, key string) error {
 	lockKey := r.getLockKey(key)
 	lockValue := r.getLockValue(key)
 
@@ -125,7 +144,7 @@ func (r *RedisLock) Unlock(ctx context.Context, key string) error {
 	}
 
 	if result.(int64) == 0 {
-		return fmt.Errorf("lock not held by this client")
+		return fmt.Errorf("exclusive lock not held by this client")
 	}
 
 	// 解锁成功后，从映射中删除锁值
@@ -134,8 +153,8 @@ func (r *RedisLock) Unlock(ctx context.Context, key string) error {
 	return nil
 }
 
-// Renew 续期锁
-func (r *RedisLock) Renew(ctx context.Context, key string, ttl time.Duration) error {
+// Renew 续期排他锁
+func (r *RedisExclusiveLock) Renew(ctx context.Context, key string, ttl time.Duration) error {
 	lockKey := r.getLockKey(key)
 	lockValue := r.getLockValue(key)
 
@@ -159,14 +178,14 @@ func (r *RedisLock) Renew(ctx context.Context, key string, ttl time.Duration) er
 	}
 
 	if result.(int64) == 0 {
-		return fmt.Errorf("lock not held by this client for key: %s", key)
+		return fmt.Errorf("exclusive lock not held by this client for key: %s", key)
 	}
 
 	return nil
 }
 
-// IsLocked 检查锁是否被持有
-func (r *RedisLock) IsLocked(ctx context.Context, key string) (bool, error) {
+// IsLocked 检查排他锁是否被持有
+func (r *RedisExclusiveLock) IsLocked(ctx context.Context, key string) (bool, error) {
 	lockKey := r.getLockKey(key)
 
 	exists, err := r.client.Exists(ctx, lockKey).Result()
@@ -178,6 +197,7 @@ func (r *RedisLock) IsLocked(ctx context.Context, key string) (bool, error) {
 }
 
 // Close 关闭连接
-func (r *RedisLock) Close() error {
-	return r.client.Close()
+func (r *RedisExclusiveLock) Close() error {
+	// Redis客户端的关闭由外部管理
+	return nil
 }
